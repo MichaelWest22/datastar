@@ -219,12 +219,8 @@ const applyToTargets = (
   }
 }
 
-const ctxIdMap = new Map<Node, Set<string>>()
-const ctxPersistentIds = new Set<string>()
-const oldIdTagNameMap = new Map<string, string>()
-const duplicateIds = new Set<string>()
-const ctxPantry = document.createElement('div')
-ctxPantry.hidden = true
+let ctxFutureMatches = new WeakSet<Node>()
+let ctxActiveElementAndParents: Element[] = []
 
 const aliasedIgnoreMorph = aliasify('ignore-morph')
 const aliasedIgnoreMorphAttr = `[${aliasedIgnoreMorph}]`
@@ -245,61 +241,25 @@ const morph = (
 
   const normalizedElt = document.createElement('div')
   normalizedElt.append(newContent)
-  document.body.insertAdjacentElement('afterend', ctxPantry)
 
-  // Computes the set of IDs that persist between the two contents excluding duplicates
-  const oldIdElements = oldElt.querySelectorAll('[id]')
-  for (const { id, tagName } of oldIdElements) {
-    if (oldIdTagNameMap.has(id)) {
-      duplicateIds.add(id)
-    } else {
-      oldIdTagNameMap.set(id, tagName)
-    }
+  ctxFutureMatches = new WeakSet()
+  ctxActiveElementAndParents = []
+  let elt = document.activeElement
+  while (elt !== oldElt) {
+    if (!elt) break
+    ctxActiveElementAndParents.push(elt)
+    elt = elt.parentElement
   }
-  if (oldElt instanceof Element && oldElt.id) {
-    if (oldIdTagNameMap.has(oldElt.id)) {
-      duplicateIds.add(oldElt.id)
-    } else {
-      oldIdTagNameMap.set(oldElt.id, oldElt.tagName)
-    }
-  }
-
-  ctxPersistentIds.clear()
-  const newIdElements = normalizedElt.querySelectorAll('[id]')
-  for (const { id, tagName } of newIdElements) {
-    if (ctxPersistentIds.has(id)) {
-      duplicateIds.add(id)
-    } else if (oldIdTagNameMap.get(id) === tagName) {
-      ctxPersistentIds.add(id)
-    }
-  }
-
-  for (const id of duplicateIds) {
-    ctxPersistentIds.delete(id)
-  }
-
-  oldIdTagNameMap.clear()
-  duplicateIds.clear()
-  ctxIdMap.clear()
 
   const parent = mode === 'outer' ? oldElt.parentElement! : oldElt
-  populateIdMapWithTree(parent, oldIdElements)
-  populateIdMapWithTree(normalizedElt, newIdElements)
-
   morphChildren(
     parent,
     normalizedElt,
     mode === 'outer' ? oldElt : null,
     oldElt.nextSibling,
   )
-
-  ctxPantry.remove()
 }
 
-// This is the core algorithm for matching up children.
-// The idea is to use ID sets to try to match up nodes as faithfully as possible.
-// We greedily match, which allows us to keep the algorithm fast,
-// but by using ID sets, we are able to better match up with content deeper in the DOM.
 const morphChildren = (
   oldParent: Element | ShadowRoot, // the old content that we are merging the new content into
   newParent: Element, // the parent element of the new content
@@ -325,13 +285,13 @@ const morphChildren = (
       if (bestMatch) {
         // if the node to morph is not at the insertion point then remove/move up to it
         if (bestMatch !== insertionPoint) {
-          let cursor: Node | null = insertionPoint
-          // Remove nodes between the start and end nodes
-          while (cursor && cursor !== bestMatch) {
-            const tempNode = cursor
-            cursor = cursor.nextSibling
-            removeNode(tempNode)
-          }
+          moveNodesBetweenToEnd(
+            oldParent,
+            insertionPoint,
+            bestMatch,
+            endPoint,
+            newChild,
+          )
         }
         morphNode(bestMatch, newChild)
         insertionPoint = bestMatch.nextSibling
@@ -339,55 +299,11 @@ const morphChildren = (
       }
     }
 
-    // if the matching node is elsewhere in the original content
-    if (newChild instanceof Element && ctxPersistentIds.has(newChild.id)) {
-      // move it and all its children here and morph, will always be found
-      // Search for an element by ID within the document and pantry, and move it using moveBefore.
-      const movedChild = document.getElementById(newChild.id) as Element
-
-      // Removes an element from its ancestors' ID maps.
-      // This is needed when an element is moved from the "future" via `moveBeforeId`.
-      // Otherwise, its erstwhile ancestors could be mistakenly moved to the pantry rather than being deleted,
-      // preventing their removal hooks from being called.
-      let current = movedChild
-      while ((current = current.parentNode as Element)) {
-        const idSet = ctxIdMap.get(current)
-        if (idSet) {
-          idSet.delete(newChild.id)
-          if (!idSet.size) {
-            ctxIdMap.delete(current)
-          }
-        }
-      }
-
-      moveBefore(oldParent, movedChild, insertionPoint)
-      morphNode(movedChild, newChild)
-      insertionPoint = movedChild.nextSibling
-      continue
-    }
-
-    // This performs the action of inserting a new node while handling situations where the node contains
-    // elements with persistent IDs and possible state info we can still preserve by moving in and then morphing
-    if (ctxIdMap.has(newChild)) {
-      // node has children with IDs with possible state so create a dummy elt of same type and apply full morph algorithm
-      const namespaceURI = (newChild as Element).namespaceURI
-      const tagName = (newChild as Element).tagName
-      const newEmptyChild =
-        namespaceURI && namespaceURI !== 'http://www.w3.org/1999/xhtml'
-          ? document.createElementNS(namespaceURI, tagName)
-          : document.createElement(tagName)
-      oldParent.insertBefore(newEmptyChild, insertionPoint)
-      morphNode(newEmptyChild, newChild)
-      insertionPoint = newEmptyChild.nextSibling
-    } else {
-      // optimization: no id state to preserve so we can just insert a clone of the newChild and its descendants
-      const newClonedChild = document.importNode(newChild, true) // importNode to not mutate newParent
-      oldParent.insertBefore(newClonedChild, insertionPoint)
-      insertionPoint = newClonedChild.nextSibling
-    }
+    const newClonedChild = document.importNode(newChild, true)
+    oldParent.insertBefore(newClonedChild, insertionPoint)
+    insertionPoint = newClonedChild.nextSibling
   }
 
-  // remove any remaining old nodes that didn't match up with new content
   while (insertionPoint && insertionPoint !== endPoint) {
     const tempNode = insertionPoint
     insertionPoint = insertionPoint.nextSibling
@@ -395,115 +311,110 @@ const morphChildren = (
   }
 }
 
-// Scans forward from the startPoint to the endPoint looking for a match for the node.
-// It looks for an id set match first, then a soft match.
-// We abort soft matching if we find two future soft matches, to reduce churn.
+const isMatch = (oldNode: Node, newNode: Node): boolean => {
+  if (oldNode.isEqualNode(newNode)) return true
+  if (oldNode instanceof Element && newNode instanceof Element) {
+    const attrs = ['id', 'name', 'href', 'src']
+    for (const attr of attrs) {
+      const v1 = oldNode.getAttribute(attr)
+      const v2 = newNode.getAttribute(attr)
+      if (v1 && v1 === v2) return true
+    }
+  }
+  return false
+}
+
+const matchesUpcomingSibling = (
+  oldNode: Node,
+  startNode: Node,
+  limit = 50,
+): boolean => {
+  if (ctxFutureMatches.has(oldNode)) return true
+  for (
+    let sibling = startNode.nextSibling, i = 0;
+    sibling && i < limit;
+    sibling = sibling.nextSibling, i++
+  ) {
+    if (isMatch(oldNode, sibling)) {
+      ctxFutureMatches.add(oldNode)
+      return true
+    }
+  }
+  return false
+}
+
+const isSoftMatch = (oldNode: Node, newNode: Node): boolean =>
+  oldNode.nodeType === newNode.nodeType &&
+  (oldNode as Element).tagName === (newNode as Element).tagName
+
 const findBestMatch = (
   node: Node,
   startPoint: Node | null,
   endPoint: Node | null,
 ): Node | null => {
-  let bestMatch: Node | null | undefined = null
-  let nextSibling = node.nextSibling
-  let siblingSoftMatchCount = 0
-  let displaceMatchCount = 0
+  if (node.nodeType !== 1) {
+    return startPoint?.nodeType === node.nodeType ? startPoint : null
+  }
 
-  // Max ID matches we are willing to displace in our search
-  const nodeMatchCount = ctxIdMap.get(node)?.size || 0
-
+  let softMatch: Node | null = null
   let cursor = startPoint
+
   while (cursor && cursor !== endPoint) {
-    // soft matching is a prerequisite for id set matching
     if (isSoftMatch(cursor, node)) {
-      let isIdSetMatch = false
-      const oldSet = ctxIdMap.get(cursor)
-      const newSet = ctxIdMap.get(node)
-
-      if (newSet && oldSet) {
-        for (const id of oldSet) {
-          // a potential match is an id in the new and old nodes that
-          // has not already been merged into the DOM
-          // But the newNode content we call this on has not been
-          // merged yet and we don't allow duplicate IDs so it is simple
-          if (newSet.has(id)) {
-            isIdSetMatch = true
-            break
-          }
-        }
-      }
-
-      if (isIdSetMatch) {
-        return cursor // found an id set match, we're done!
-      }
-
-      // we haven’t yet saved a soft match fallback
-      // the current soft match will hard match something else in the future, leave it
-      if (!bestMatch && !ctxIdMap.has(cursor)) {
-        // optimization: if node can't id set match, we can just return the soft match immediately
-        if (!nodeMatchCount) {
-          return cursor
-        }
-        // save this as the fallback if we get through the loop without finding a hard match
-        bestMatch = cursor
-      }
+      if (isMatch(cursor, node)) return cursor
+      if (!softMatch) softMatch = cursor
     }
-
-    // check for IDs we may be displaced when matching
-    displaceMatchCount += ctxIdMap.get(cursor)?.size || 0
-    if (displaceMatchCount > nodeMatchCount) {
-      // if we are going to displace more IDs than the node contains then
-      // we do not have a good candidate for an ID match, so return
-      break
-    }
-
-    if (bestMatch === null && nextSibling && isSoftMatch(cursor, nextSibling)) {
-      // The next new node has a soft match with this node, so
-      // increment the count of future soft matches
-      siblingSoftMatchCount++
-      nextSibling = nextSibling.nextSibling
-
-      // If there are two future soft matches, block soft matching for this node to allow
-      // future siblings to soft match. This is to reduce churn in the DOM when an element
-      // is prepended.
-      if (siblingSoftMatchCount >= 2) {
-        bestMatch = undefined
-      }
-    }
-
+    if (ctxActiveElementAndParents.includes(cursor as Element)) break
     cursor = cursor.nextSibling
   }
 
-  return bestMatch || null
+  if (softMatch && matchesUpcomingSibling(softMatch, node)) return null
+  return softMatch
 }
 
-// ok to cast: if one is not element, `id` and `tagName` will be null and we'll just compare that.
-const isSoftMatch = (oldNode: Node, newNode: Node): boolean =>
-  oldNode.nodeType === newNode.nodeType &&
-  (oldNode as Element).tagName === (newNode as Element).tagName &&
-  // If oldElt has an `id` with possible state and it doesn’t match newElt.id then avoid morphing.
-  // We'll still match an anonymous node with an IDed newElt, though, because if it got this far,
-  // its not persistent, and new nodes can't have any hidden state.
-  (!(oldNode as Element).id ||
-    (oldNode as Element).id === (newNode as Element).id)
-
-// Gets rid of an unwanted DOM node; strategy depends on nature of its reuse:
-// - Persistent nodes will be moved to the pantry for later reuse
-// - Other nodes will have their hooks called, and then are removed
 const removeNode = (node: Node): void => {
-  // are we going to id set match this later?
-  ctxIdMap.has(node)
-    ? // skip callbacks and move to pantry
-      moveBefore(ctxPantry, node, null)
-    : // remove for realsies
-      node.parentNode?.removeChild(node)
+  node.parentNode?.removeChild(node)
 }
 
-// Moves an element before another element within the same parent.
-// Uses the proposed `moveBefore` API if available (and working), otherwise falls back to `insertBefore`.
-// This is essentially a forward-compat wrapper.
-const moveBefore: (parentNode: Node, node: Node, after: Node | null) => void =
+const moveNodesBetweenToEnd = (
+  oldParent: Element | ShadowRoot,
+  startInclusive: Node,
+  endExclusive: Node,
+  originalEndPoint: Node | null,
+  currentNewChild: Node,
+): void => {
+  let cursor: Node | null = startInclusive
+  while (cursor && cursor !== endExclusive) {
+    const tempNode = cursor
+    cursor = cursor.nextSibling
+    if (
+      tempNode instanceof Element &&
+      matchesUpcomingSibling(tempNode, currentNewChild)
+    ) {
+      moveBefore(oldParent, tempNode, originalEndPoint)
+    } else {
+      removeNode(tempNode)
+    }
+  }
+}
+
+const moveBefore = (
+  parentNode: Node,
+  node: Node,
+  after: Node | null,
+): void => {
   // @ts-expect-error
-  removeNode.call.bind(ctxPantry.moveBefore ?? ctxPantry.insertBefore)
+  if (parentNode.moveBefore) {
+    try {
+      // @ts-expect-error
+      parentNode.moveBefore(node, after)
+    } catch {
+      parentNode.insertBefore(node, after)
+    }
+  } else {
+    parentNode.insertBefore(node, after)
+  }
+}
 
 const aliasedPreserveAttr = aliasify('preserve-attr')
 
@@ -602,30 +513,4 @@ const morphNode = (
   }
 
   return oldNode
-}
-
-// A bottom-up algorithm that populates a map of Element -> IdSet.
-// The ID set for a given element is the set of all IDs contained within its subtree.
-// As an optimization, we filter these IDs through the given list of persistent IDs,
-// because we don't need to bother considering IDed elements that won't be in the new content.
-const populateIdMapWithTree = (
-  root: Element | ShadowRoot | null,
-  elements: Iterable<Element>,
-): void => {
-  for (const elt of elements) {
-    if (ctxPersistentIds.has(elt.id)) {
-      let current: Element | null = elt
-      // walk up the parent hierarchy of that element, adding the ID of element to the parent's ID set
-      while (current && current !== root) {
-        let idSet = ctxIdMap.get(current)
-        // if the ID set doesn’t exist, create it and insert it in the map
-        if (!idSet) {
-          idSet = new Set()
-          ctxIdMap.set(current, idSet)
-        }
-        idSet.add(elt.id)
-        current = current.parentElement
-      }
-    }
-  }
 }
